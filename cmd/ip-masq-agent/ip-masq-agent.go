@@ -55,10 +55,11 @@ var (
 
 // MasqConfig object
 type MasqConfig struct {
-	NonMasqueradeCIDRs []string `json:"nonMasqueradeCIDRs"`
-	MasqLinkLocal      bool     `json:"masqLinkLocal"`
-	MasqLinkLocalIPv6  bool     `json:"masqLinkLocalIPv6"`
-	ResyncInterval     Duration `json:"resyncInterval"`
+	NonMasqueradeCIDRs    []string `json:"nonMasqueradeCIDRs"`
+	MasqLinkLocal         bool     `json:"masqLinkLocal"`
+	MasqLinkLocalIPv6     bool     `json:"masqLinkLocalIPv6"`
+	ResyncInterval        Duration `json:"resyncInterval"`
+	NonMasqueradeSrcCIDRs []string `json:"nonMasqueradeSrcCIDRs,omitempty"`
 }
 
 // Duration - Go's JSON unmarshaler can't handle time.ParseDuration syntax when unmarshaling into time.Duration, so we do it here
@@ -239,6 +240,20 @@ func (c *MasqConfig) validate() error {
 			return fmt.Errorf("ipv6 is not enabled, but ipv6 cidr %s provided. Enable ipv6 using --enable-ipv6 agent flag", cidr)
 		}
 	}
+	n = len(c.NonMasqueradeSrcCIDRs)
+	if n > 64 {
+		return fmt.Errorf("the daemon can only accept up to 64 src CIDRs, but got %d CIDRs", n)
+	}
+	// check CIDRs are valid
+	for _, cidr := range c.NonMasqueradeSrcCIDRs {
+		if err := validateCIDR(cidr); err != nil {
+			return err
+		}
+		// can't configure ipv6 cidr if ipv6 is not enabled
+		if !*enableIPv6 && isIPv6CIDR(cidr) {
+			return fmt.Errorf("ipv6 is not enabled, but ipv6 cidr %s provided. Enable ipv6 using --enable-ipv6 agent flag", cidr)
+		}
+	}
 	return nil
 }
 
@@ -271,6 +286,13 @@ func (m *MasqDaemon) syncMasqRules() error {
 	lines := bytes.NewBuffer(nil)
 	writeLine(lines, "*nat")
 	writeLine(lines, utiliptables.MakeChainLine(masqChain)) // effectively flushes masqChain atomically with rule restore
+
+	// non-masquerade for user-provided src CIDRs
+	for _, cidr := range m.config.NonMasqueradeSrcCIDRs {
+		if !isIPv6CIDR(cidr) {
+			writeNonMasqSrcRule(lines, cidr)
+		}
+	}
 
 	// link-local CIDR is always non-masquerade
 	if !m.config.MasqLinkLocal {
@@ -312,6 +334,13 @@ func (m *MasqDaemon) syncMasqRulesIPv6() error {
 		lines6 := bytes.NewBuffer(nil)
 		writeLine(lines6, "*nat")
 		writeLine(lines6, utiliptables.MakeChainLine(masqChain)) // effectively flushes masqChain atomically with rule restore
+
+		// non-masquerade for user-provided src CIDRs
+		for _, cidr := range m.config.NonMasqueradeSrcCIDRs {
+			if isIPv6CIDR(cidr) {
+				writeNonMasqSrcRule(lines6, cidr)
+			}
+		}
 
 		// link-local IPv6 CIDR is non-masquerade by default
 		if !m.config.MasqLinkLocalIPv6 {
@@ -366,6 +395,10 @@ const nonMasqRuleComment = `-m comment --comment "ip-masq-agent: local traffic i
 
 func writeNonMasqRule(lines *bytes.Buffer, cidr string) {
 	writeRule(lines, utiliptables.Append, masqChain, nonMasqRuleComment, "-d", cidr, "-j", "RETURN")
+}
+
+func writeNonMasqSrcRule(lines *bytes.Buffer, cidr string) {
+	writeRule(lines, utiliptables.Append, masqChain, nonMasqRuleComment, "-s", cidr, "-j", "RETURN")
 }
 
 const masqRuleComment = `-m comment --comment "ip-masq-agent: outbound traffic is subject to MASQUERADE (must be last in chain)"`
